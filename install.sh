@@ -32,7 +32,7 @@ fi
 HOSTAPD_WAS=$(systemctl is-active hostapd 2>/dev/null || true)
 DNSMASQ_WAS=$(systemctl is-active dnsmasq 2>/dev/null || true)
 apt-get update -qq
-DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hostapd dnsmasq nftables
+DEBIAN_FRONTEND=noninteractive apt-get install -y -qq hostapd dnsmasq nftables iw
 if [ "$WROTE_POLICY" = "1" ]; then
     rm -f "$POLICY"
 fi
