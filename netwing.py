@@ -31,7 +31,7 @@ import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_NAME = "netwing"
 
 # Real paths (all remapped under fake root when NETWING_FAKE_ROOT is set,
@@ -55,8 +55,16 @@ DEFAULTS = {
     "ssid": "netwing",
     "password": "",               # asked in the wizard; WPA2, 8+ chars
     "subnet": "10.77.77.0/24",    # uncommon range, avoids typical LANs
+    # "ethernet": cable uplink, AP on wlan0.
+    # "repeater": clone the home Wi-Fi - wlan0 stays a client, a virtual
+    # ap0 interface broadcasts the AP on the SAME channel (single radio).
+    # Chosen by the operator in the setup wizard; never assumed.
+    "mode": None,
     "ap_if": "wlan0",
     "uplink_if": "eth0",
+    "sta_if": "wlan0",            # repeater mode: client side of the radio
+    "ap_channel": 6,              # repeater mode: forced to the upstream
+    "ap_hw_mode": "g",            # channel/band at apply time
     "dns_upstreams": ["1.1.1.1", "9.9.9.9"],
     # "new_devices": approve a device once, remembered by MAC.
     # "every_connect": every DHCP lease needs a fresh approval.
@@ -361,15 +369,17 @@ interface=%s
 driver=nl80211
 ssid=%s
 country_code=US
-hw_mode=g
-channel=6
+hw_mode=%s
+channel=%s
 wmm_enabled=1
 auth_algs=1
 wpa=2
 wpa_passphrase=%s
 wpa_key_mgmt=WPA-PSK
 rsn_pairwise=CCMP
-""" % (now_iso(), cfg["ap_if"], cfg["ssid"], cfg["password"])
+""" % (now_iso(), cfg["ap_if"], cfg["ssid"],
+           cfg.get("ap_hw_mode", "g"), cfg.get("ap_channel", 6),
+           cfg["password"])
 
 
 def render_dnsmasq(cfg):
@@ -483,6 +493,61 @@ WATCHED_SERVICES = ["hostapd", "dnsmasq", "NetworkManager", "dhcpcd",
                     "wpa_supplicant", "guestwing"]
 
 
+def parse_iw_combinations(text):
+    """True when the Wi-Fi chip/driver reports a combination allowing a
+    managed (client) interface and an AP interface at once - the hardware
+    requirement for single-radio repeating. Read from `iw list`."""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("#{") or line.startswith("* #{"):
+            pass
+        if "managed" in line and "AP" in line and "#{" in line:
+            return True
+    return False
+
+
+def freq_to_channel(freq_mhz):
+    freq = int(freq_mhz)
+    if 2412 <= freq <= 2472:
+        return (freq - 2407) // 5, "g"
+    if freq == 2484:
+        return 14, "g"
+    if freq >= 5000:
+        return (freq - 5000) // 5, "a"
+    return None, "g"
+
+
+def parse_iw_link(text):
+    """Parse `iw dev <if> link`. Returns {ssid, bssid, freq, channel,
+    hw_mode} or None when not connected."""
+    if "Not connected" in text or "SSID" not in text:
+        return None
+    info = {}
+    m = re.search(r"^Connected to\s+([0-9a-f:]+)", text, re.M)
+    if m:
+        info["bssid"] = m.group(1)
+    m = re.search(r"^\s*SSID:\s*(.+)$", text, re.M)
+    if m:
+        info["ssid"] = m.group(1).strip()
+    m = re.search(r"^\s*freq:\s*(\d+)", text, re.M)
+    if m:
+        info["freq"] = int(m.group(1))
+        info["channel"], info["hw_mode"] = freq_to_channel(info["freq"])
+    return info if info.get("ssid") else None
+
+
+def iw_link(ifname):
+    rc, out, _ = SYS.run(["iw", "dev", ifname, "link"])
+    return parse_iw_link(out)
+
+
+def iw_supports_repeater():
+    rc, out, _ = SYS.run(["iw", "list"])
+    if rc != 0 or not out.strip():
+        return None                       # cannot tell (iw missing?)
+    return parse_iw_combinations(out)
+
+
 def collect_interfaces():
     """{name: {up, mac, ipv4, carrier}} from ip -j addr."""
     rc, out, _ = SYS.run(["ip", "-j", "addr", "show"])
@@ -564,8 +629,10 @@ def active_services():
     return states
 
 
-def missing_binaries():
+def missing_binaries(cfg=None):
     need = {"hostapd": "hostapd", "dnsmasq": "dnsmasq", "nft": "nftables"}
+    if (cfg or load_config()).get("mode") == "repeater":
+        need["iw"] = "iw"
     missing = []
     for binary, pkg in need.items():
         if SYS.fake_root:
@@ -579,39 +646,75 @@ def run_preflight(cfg=None):
     """Read-only inspection. Returns {ok, blocks, warnings, facts}.
     A block means apply refuses; a warning needs an explicit typed override."""
     cfg = cfg or load_config()
-    blocks, warnings, facts = [], [], {}
+    mode = cfg.get("mode") or "ethernet"
+    blocks, warnings, facts = [], [], {"mode": mode}
     ifaces = collect_interfaces()
     facts["interfaces"] = ifaces
-    ap, uplink = cfg["ap_if"], cfg["uplink_if"]
+    ap = cfg["ap_if"]
 
-    if ap not in ifaces:
-        blocks.append("AP interface %s does not exist on this machine" % ap)
-    if uplink not in ifaces:
-        blocks.append("uplink interface %s does not exist" % uplink)
+    if mode == "repeater":
+        sta = cfg["sta_if"]
+        facts["uplink_ipv4"] = ifaces.get(sta, {}).get("ipv4", [])
+        if sta not in ifaces:
+            blocks.append("Wi-Fi interface %s does not exist" % sta)
+        support = iw_supports_repeater()
+        facts["repeater_support"] = support
+        if support is False:
+            blocks.append("this Pi's Wi-Fi chip/driver does not report "
+                          "simultaneous client+AP support, so repeating is "
+                          "not possible on it - use ethernet mode")
+        elif support is None:
+            warnings.append("could not verify client+AP support "
+                            "(iw missing or failed) - install iw first")
+        link = iw_link(sta)
+        facts["upstream"] = link
+        if not link:
+            blocks.append("%s is not connected to your home Wi-Fi - "
+                          "connect it first, then re-run" % sta)
+        else:
+            facts["upstream_channel"] = link.get("channel")
+            warnings.append(
+                "repeating shares ONE radio: roughly half throughput, and "
+                "if your home router changes channel the netwing network "
+                "drops with it. Channel locked to the router's current "
+                "channel %s." % link.get("channel"))
     else:
-        up = ifaces[uplink]
-        facts["uplink_ipv4"] = up["ipv4"]
-        if not up["carrier"] and not up["ipv4"]:
-            blocks.append("uplink %s has no cable/link - the base version "
-                          "needs ethernet plugged in" % uplink)
-        elif not up["ipv4"]:
-            blocks.append("uplink %s has link but no IPv4 address yet"
-                          % uplink)
+        uplink = cfg["uplink_if"]
+        if ap not in ifaces:
+            blocks.append("AP interface %s does not exist on this machine"
+                          % ap)
+        if uplink not in ifaces:
+            blocks.append("uplink interface %s does not exist" % uplink)
+        else:
+            up = ifaces[uplink]
+            facts["uplink_ipv4"] = up["ipv4"]
+            if not up["carrier"] and not up["ipv4"]:
+                blocks.append("uplink %s has no cable/link - ethernet mode "
+                              "needs a cable plugged in" % uplink)
+            elif not up["ipv4"]:
+                blocks.append("uplink %s has link but no IPv4 address yet"
+                              % uplink)
 
     route_dev = default_route_dev()
     facts["default_route_dev"] = route_dev
-    if route_dev == ap:
+    if mode != "repeater" and route_dev == ap:
         blocks.append("your internet currently comes IN through %s (Wi-Fi). "
-                      "The base version turns %s into an access point, which "
-                      "would cut that. Plug in ethernet first." % (ap, ap))
+                      "Ethernet mode turns %s into an access point, which "
+                      "would cut that. Plug in ethernet first - or use "
+                      "repeater mode." % (ap, ap))
 
     ssh = []
     for ip in ssh_client_ips():
         dev = route_dev_for(ip)
         ssh.append({"ip": ip, "dev": dev})
-        if dev == ap:
+        if mode != "repeater" and dev == ap:
             blocks.append("SSH session from %s arrives via %s - applying "
                           "would cut this session" % (ip, ap))
+        if mode == "repeater" and dev == cfg["sta_if"]:
+            warnings.append("your SSH session from %s rides the same Wi-Fi "
+                            "radio you are repeating - expect it to be "
+                            "slower, and it can drop if the router hops "
+                            "channels" % ip)
     facts["ssh_sessions"] = ssh
 
     svc = active_services()
@@ -626,7 +729,7 @@ def run_preflight(cfg=None):
     if svc.get("NetworkManager") == "active":
         warnings.append("NetworkManager may fight for control of %s" % ap)
 
-    missing = missing_binaries()
+    missing = missing_binaries(cfg)
     if missing:
         warnings.append("missing packages: %s (run: sudo apt install %s)"
                         % (", ".join(b for b, _ in missing),
@@ -659,6 +762,12 @@ def apply(cfg, stop_services=("wpa_supplicant",)):
     disconnect mid-apply still reverts. Returns the backup dir. Callers
     must have shown the plan and collected a typed YES already."""
     backup_dir = backup_existing()
+    if cfg.get("mode") == "repeater":
+        link = iw_link(cfg["sta_if"])
+        if link and link.get("channel"):
+            # single radio: the AP MUST sit on the upstream channel
+            cfg["ap_channel"] = link["channel"]
+            cfg["ap_hw_mode"] = link.get("hw_mode", "g")
     cfg["applied_at"] = now_iso()
     cfg["stop_services"] = []
     save_config(cfg)
@@ -703,6 +812,11 @@ def net_up(cfg):
     ip = ap_ip(cfg)
     prefix = ipaddress.ip_network(cfg["subnet"]).prefixlen
     ap = cfg["ap_if"]
+    if cfg.get("mode") == "repeater":
+        SYS.run(["ip", "link", "set", cfg["sta_if"], "up"])
+        # virtual AP interface sharing the radio with the client link
+        SYS.run(["iw", "dev", cfg["sta_if"], "interface", "add", ap,
+                 "type", "__ap"])
     SYS.run(["ip", "link", "set", ap, "up"])
     SYS.run(["ip", "addr", "replace", "%s/%d" % (ip, prefix), "dev", ap])
     SYS.run(["nft", "-f", NFT_PATH])
@@ -738,6 +852,8 @@ def revert(cfg=None, purge=False):
         if SYS.exists(path):
             os.remove(SYS.remap(path))
     SYS.run(["nft", "delete", "table", "inet", "netwing"])
+    if cfg.get("mode") == "repeater":
+        SYS.run(["iw", "dev", cfg["ap_if"], "del"])
     ip = ap_ip(cfg)
     prefix = ipaddress.ip_network(cfg["subnet"]).prefixlen
     SYS.run(["ip", "addr", "del", "%s/%d" % (ip, prefix),
@@ -898,8 +1014,9 @@ def draw_tab_bar(win, current, width):
 
 def ui_status(win, cfg, st, y0=3):
     lines = [
-        "SSID: %s   network: %s   uplink: %s" % (
-            cfg["ssid"], cfg["subnet"], cfg["uplink_if"]),
+        "mode: %s   SSID: %s   network: %s   uplink: %s" % (
+            cfg.get("mode") or "not set", cfg["ssid"], cfg["subnet"],
+            cfg["uplink_if"]),
         "Router active: %s   AP: %s   DNS: %s   portal: %s" % (
             "yes" if st["applied"] else "no",
             "up" if st["ap"] else "down",
@@ -1088,6 +1205,28 @@ def wizard_network(cfg):
     print("saved. Re-run netwing to apply with the new name/password.")
 
 
+def wizard_mode(cfg):
+    """The operator picks the uplink explicitly - there is no default."""
+    if cfg.get("mode") in ("ethernet", "repeater"):
+        return
+    print("\nHow should netwing get its internet?")
+    print("  1 = ethernet cable to your home router (stable, recommended)")
+    print("  2 = repeat your existing Wi-Fi (no cable; shares one radio,")
+    print("      slower, and drops if your router changes channel)")
+    while cfg.get("mode") not in ("ethernet", "repeater"):
+        choice = ask("choose 1 or 2: ")
+        if choice == "1":
+            cfg["mode"] = "ethernet"
+            cfg["ap_if"], cfg["uplink_if"] = "wlan0", "eth0"
+        elif choice == "2":
+            cfg["mode"] = "repeater"
+            cfg["ap_if"], cfg["uplink_if"], cfg["sta_if"] = \
+                "ap0", "wlan0", "wlan0"
+        else:
+            print("please type 1 or 2")
+    save_config(cfg)
+
+
 def wizard_approval_mode(cfg):
     """The operator must pick explicitly - there is no default."""
     print("\nHow should internet approval work?")
@@ -1105,7 +1244,7 @@ def wizard_approval_mode(cfg):
 
 
 def show_plan(cfg, pre):
-    print("\nnetwing plan")
+    print("\nnetwing plan (mode: %s)" % cfg.get("mode"))
     print("  - turn %s into Wi-Fi access point '%s'" % (cfg["ap_if"],
                                                    cfg["ssid"]))
     print("  - hand out addresses on %s, route them out %s (NAT)"
@@ -1126,6 +1265,7 @@ def show_plan(cfg, pre):
 
 
 def confirm_apply_cli(cfg):
+    wizard_mode(cfg)
     if not cfg.get("ssid") or not cfg.get("password"):
         wizard_network(cfg)
     wizard_approval_mode(cfg)
