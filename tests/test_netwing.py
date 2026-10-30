@@ -27,6 +27,28 @@ TCP_FIXTURE = """  sl  local_address rem_address   st tx_queue rx_queue tr tm->w
 """
 
 
+
+IW_LIST_OK = """
+Wiphy phy0
+\tvalid interface combinations:
+\t\t * #{ managed } <= 1, #{ P2P-device } <= 1, #{ AP } <= 1,
+\t\t   channels <= 2
+\t\t * #{ managed, AP } <= 1, #{ P2P-client } <= 1,
+\t\t   channels <= 1
+\tmax # scan SSIDs: 10
+"""
+IW_LIST_NO = """
+Wiphy phy0
+\tvalid interface combinations:
+\t\t * #{ managed } <= 1,
+\t\t   channels <= 1
+"""
+IW_LINK = """Connected to 9c:53:22:11:22:33 (on wlan0)
+\tSSID: HomeWifi
+\tfreq: 2437
+\tRX: 1000 bytes (10 packets)
+"""
+
 def hexip(ip):
     b = bytes(int(x) for x in ip.split("."))
     return b[::-1].hex().upper()
@@ -271,6 +293,89 @@ class TestApplyRevert(Base):
         # fake mode: is-active returns rc 0 with empty out -> not stopped
         netwing.revert(cfg)
         self.assertIsNone(cfg["applied_at"])
+
+
+
+
+class TestRepeater(Base):
+    def test_combinations_parser(self):
+        self.assertTrue(netwing.parse_iw_combinations(IW_LIST_OK))
+        self.assertFalse(netwing.parse_iw_combinations(IW_LIST_NO))
+
+    def test_link_parser(self):
+        link = netwing.parse_iw_link(IW_LINK)
+        self.assertEqual(link["ssid"], "HomeWifi")
+        self.assertEqual(link["channel"], 6)
+        self.assertEqual(link["hw_mode"], "g")
+        self.assertIsNone(netwing.parse_iw_link("Not connected.\n"))
+
+    def test_freq_5ghz(self):
+        self.assertEqual(netwing.freq_to_channel(5180), (36, "a"))
+        self.assertEqual(netwing.freq_to_channel(2412), (1, "g"))
+
+    def repeater_cfg(self):
+        c = dict(netwing.DEFAULTS)
+        c.update({"mode": "repeater", "ap_if": "ap0", "uplink_if": "wlan0",
+                  "sta_if": "wlan0", "ssid": "t", "password": "12345678",
+                  "approval_mode": "new_devices"})
+        return c
+
+    def fake_run_repeater(self, connected=True, supported=True):
+        def run(cmd, capture=True, check=False):
+            self.sys.ran.append(list(cmd))
+            if cmd[:3] == ["ip", "-j", "addr"]:
+                return 0, json.dumps([{"ifname": "wlan0", "flags": ["UP"],
+                    "address": "b8:27:eb:00:00:02",
+                    "addr_info": [{"family": "inet", "local": "192.168.1.77"}]}]), ""
+            if cmd[:4] == ["ip", "-j", "route", "show"]:
+                return 0, json.dumps([{"dst": "default", "dev": "wlan0"}]), ""
+            if cmd[:2] == ["iw", "list"]:
+                return 0, IW_LIST_OK if supported else IW_LIST_NO, ""
+            if cmd[:3] == ["iw", "dev", "wlan0"] or cmd[:4] == ["iw", "dev", "wlan0", "link"]:
+                return 0, IW_LINK if connected else "Not connected.\n", ""
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return 3, "inactive\n", ""
+            return 0, "", ""
+        return run
+
+    def test_repeater_preflight_ok(self):
+        self.sys.run = self.fake_run_repeater()
+        pre = netwing.run_preflight(self.repeater_cfg())
+        self.assertTrue(pre["ok"], pre["blocks"])
+        self.assertEqual(pre["facts"]["upstream_channel"], 6)
+
+    def test_repeater_not_connected_blocks(self):
+        self.sys.run = self.fake_run_repeater(connected=False)
+        pre = netwing.run_preflight(self.repeater_cfg())
+        self.assertFalse(pre["ok"])
+
+    def test_repeater_unsupported_blocks(self):
+        self.sys.run = self.fake_run_repeater(supported=False)
+        pre = netwing.run_preflight(self.repeater_cfg())
+        self.assertFalse(pre["ok"])
+        self.assertTrue(any("client+AP" in b for b in pre["blocks"]))
+
+    def test_repeater_apply_locks_channel(self):
+        self.sys.run = self.fake_run_repeater()
+        cfg = self.repeater_cfg()
+        cfg["ap_channel"] = 1
+        netwing.apply(cfg)
+        self.assertEqual(cfg["ap_channel"], 6)
+        hostapd = self.sys.read(netwing.HOSTAPD_PATH)
+        self.assertIn("channel=6", hostapd)
+        self.assertIn("interface=ap0", hostapd)
+        self.assertIn(["iw", "dev", "wlan0", "interface", "add", "ap0",
+                       "type", "__ap"], self.sys.ran) if False else None
+        netwing.net_up(cfg)
+        self.assertIn(["iw", "dev", "wlan0", "interface", "add", "ap0",
+                       "type", "__ap"], self.sys.ran)
+
+    def test_repeater_revert_deletes_ap0(self):
+        self.sys.run = self.fake_run_repeater()
+        cfg = self.repeater_cfg()
+        netwing.apply(cfg)
+        netwing.revert(cfg)
+        self.assertIn(["iw", "dev", "ap0", "del"], self.sys.ran)
 
 
 class TestCLI(Base):
