@@ -378,6 +378,67 @@ class TestRepeater(Base):
         self.assertIn(["iw", "dev", "ap0", "del"], self.sys.ran)
 
 
+
+class TestRepeaterBlocks(Base):
+    def repeater_cfg(self):
+        c = dict(netwing.DEFAULTS)
+        c.update({"mode": "repeater", "ap_if": "ap0", "uplink_if": "wlan0",
+                  "sta_if": "wlan0", "ssid": "t", "password": "12345678",
+                  "approval_mode": "new_devices"})
+        return c
+
+    def fake_run(self, iw_list_rc=0, iw_list_out=IW_LIST_OK,
+                 link_out=IW_LINK):
+        def run(cmd, capture=True, check=False):
+            self.sys.ran.append(list(cmd))
+            if cmd[:3] == ["ip", "-j", "addr"]:
+                return 0, json.dumps([{"ifname": "wlan0", "flags": ["UP"],
+                    "address": "b8:27:eb:00:00:02",
+                    "addr_info": [{"family": "inet",
+                                   "local": "192.168.1.77"}]}]), ""
+            if cmd[:4] == ["ip", "-j", "route", "show"]:
+                return 0, json.dumps([{"dst": "default", "dev": "wlan0"}]), ""
+            if cmd[:2] == ["iw", "list"]:
+                return iw_list_rc, iw_list_out, ""
+            if cmd[:4] == ["iw", "dev", "wlan0", "link"]:
+                return 0, link_out, ""
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return 3, "inactive\n", ""
+            return 0, "", ""
+        return run
+
+    def test_unknown_support_blocks(self):
+        self.sys.run = self.fake_run(iw_list_rc=1, iw_list_out="")
+        pre = netwing.run_preflight(self.repeater_cfg())
+        self.assertFalse(pre["ok"])
+        self.assertTrue(any("verify client+AP" in b for b in pre["blocks"]))
+
+    def test_no_channel_blocks(self):
+        link = "Connected to 9c:53:22:11:22:33 (on wlan0)\n\tSSID: H\n"
+        self.sys.run = self.fake_run(link_out=link)
+        pre = netwing.run_preflight(self.repeater_cfg())
+        self.assertFalse(pre["ok"])
+        self.assertTrue(any("channel" in b for b in pre["blocks"]))
+
+    def test_missing_iw_blocks_repeater(self):
+        self.sys.run = self.fake_run()
+        orig_which, orig_root = netwing.shutil.which, self.sys.fake_root
+        netwing.shutil.which = lambda b: None if b == "iw" else "/usr/sbin/" + b
+        self.sys.fake_root = ""
+        try:
+            pre = netwing.run_preflight(self.repeater_cfg())
+        finally:
+            netwing.shutil.which = orig_which
+            self.sys.fake_root = orig_root
+        self.assertFalse(pre["ok"])
+        self.assertTrue(any("iw" in b for b in pre["blocks"]))
+
+    def test_apply_aborts_without_link(self):
+        self.sys.run = self.fake_run(link_out="Not connected.\n")
+        with self.assertRaises(RuntimeError):
+            netwing.apply(self.repeater_cfg())
+
+
 class TestCLI(Base):
     def test_pending_and_approve(self):
         netwing.note_lease("add", "aa:bb:cc:dd:ee:ff", "10.77.77.5", "dev")
