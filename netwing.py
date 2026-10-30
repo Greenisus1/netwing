@@ -664,13 +664,18 @@ def run_preflight(cfg=None):
                           "simultaneous client+AP support, so repeating is "
                           "not possible on it - use ethernet mode")
         elif support is None:
-            warnings.append("could not verify client+AP support "
-                            "(iw missing or failed) - install iw first")
+            blocks.append("could not verify client+AP support (iw is "
+                          "missing or failed) - install iw and re-run; "
+                          "repeating is not allowed without this check")
         link = iw_link(sta)
         facts["upstream"] = link
         if not link:
             blocks.append("%s is not connected to your home Wi-Fi - "
                           "connect it first, then re-run" % sta)
+        elif not link.get("channel"):
+            blocks.append("could not read the upstream Wi-Fi channel from "
+                          "%s - repeating must lock to it, so this blocks "
+                          "activation" % sta)
         else:
             facts["upstream_channel"] = link.get("channel")
             warnings.append(
@@ -730,7 +735,12 @@ def run_preflight(cfg=None):
         warnings.append("NetworkManager may fight for control of %s" % ap)
 
     missing = missing_binaries(cfg)
-    if missing:
+    if missing and mode == "repeater":
+        blocks.append("missing packages required for repeating: %s (run: "
+                      "sudo apt install %s, then re-run)"
+                      % (", ".join(b for b, _ in missing),
+                         " ".join(sorted({p for _, p in missing}))))
+    elif missing:
         warnings.append("missing packages: %s (run: sudo apt install %s)"
                         % (", ".join(b for b, _ in missing),
                            " ".join(sorted({p for _, p in missing}))))
@@ -764,10 +774,14 @@ def apply(cfg, stop_services=("wpa_supplicant",)):
     backup_dir = backup_existing()
     if cfg.get("mode") == "repeater":
         link = iw_link(cfg["sta_if"])
-        if link and link.get("channel"):
-            # single radio: the AP MUST sit on the upstream channel
-            cfg["ap_channel"] = link["channel"]
-            cfg["ap_hw_mode"] = link.get("hw_mode", "g")
+        if not link or not link.get("channel"):
+            raise RuntimeError(
+                "no live upstream Wi-Fi link/channel on %s - refusing to "
+                "start repeating without verified radio evidence"
+                % cfg["sta_if"])
+        # single radio: the AP MUST sit on the upstream channel
+        cfg["ap_channel"] = link["channel"]
+        cfg["ap_hw_mode"] = link.get("hw_mode", "g")
     cfg["applied_at"] = now_iso()
     cfg["stop_services"] = []
     save_config(cfg)
