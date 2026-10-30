@@ -28,8 +28,12 @@ Built with AI assistance from my design.
   ads from the same domains as the videos themselves, so a DNS blocker
   can only block both or neither. netwing says so in the app instead of
   pretending.
-- The Wi-Fi repeater ("clone an existing network") mode is planned, not
-  in this version. This version needs an ethernet cable to the router.
+- Wi-Fi repeating ("clone an existing network") shares the Pi's single
+  radio: throughput is roughly halved, the netwing network must sit on
+  the same channel as your home router, and if the router hops channels
+  the netwing network drops with it. Preflight CHECKS whether your Pi's
+  Wi-Fi chip supports simultaneous client+AP and refuses if it does not.
+  Ethernet mode is the stable default.
 
 ## Install (on your Home Pi)
 
@@ -44,6 +48,9 @@ Then plug an ethernet cable from the Pi into your home router and:
 ```sh
 sudo netwing --apply
 ```
+
+Setup asks you to pick: **ethernet uplink** (cable to the router) or
+**repeater** (clone the home Wi-Fi over the air), and the approval rule.
 
 `--apply` first runs a **read-only preflight**: it checks your
 interfaces, where your internet comes from, and which interface your
